@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASCII Lilies</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: pointer; }
+  #msg {
+  position: fixed;
+  left: 0; right: 0; bottom: 6vh;
+  text-align: center;
+  padding: 0 6vw;
+  font-family: 'Courier New', Courier, 'American Typewriter', monospace;
+  font-size: clamp(14px, 2.2vw, 24px);
+  letter-spacing: 0.06em;
+  color: #fff0c8;
+  text-shadow: 0 0 8px rgba(244, 182, 203, 0.5);
+  pointer-events: none;   /* clicks still replay the bloom */
+  white-space: pre-line;  /* lets you use line breaks */
+}
+#msg::after {             /* blinking cursor */
+  content: '|';
+  margin-left: 2px;
+  animation: blink 1s steps(1) infinite;
+}
+@keyframes blink { 50% { opacity: 0; } }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="msg"></div>
+<script>
+/*
+  ASCII LILIES  (click or press space to replay the bloom)
+
+  How it works:
+   1. drawScene() paints the bouquet with normal canvas shapes onto a tiny
+      hidden canvas. That canvas has exactly one pixel per character cell.
+   2. render() reads every pixel and prints a dense character in that
+      pixel's colour on the visible canvas. Small, dense characters make it
+      look like a soft painting instead of visible letters.
+   3. A clock `p` (seconds since start) drives the animation: stems grow,
+      then each lily opens (bloom 0 -> 1), then everything sways.
+*/
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+
+const FONT = 'Menlo, Consolas, "DejaVu Sans Mono", monospace';
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = (t) => 1 - Math.pow(1 - t, 3);   // fast start, soft landing
+
+let dpr, fontSize, cellW, cellH, cols, rows, sw, sh, ox, oy;
+
+// ---------- 1. grid setup ----------
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = window.innerWidth, h = window.innerHeight;
+  fontSize = clamp(Math.floor(Math.min(w / 160, h / 140)), 4, 8);
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.font = `bold ${fontSize}px ${FONT}`;
+  cellW = ctx.measureText('M').width || fontSize * 0.6;
+  cellH = fontSize;
+  cols = Math.floor(w / cellW);
+  rows = Math.floor(h / cellH);
+  off.width = cols;                    // 1 hidden pixel = 1 character cell
+  off.height = rows;
+  sw = cols;                           // scene size in "square" units
+  sh = rows * cellH / cellW;
+  ox = (w - cols * cellW) / 2;
+  oy = (h - rows * cellH) / 2;
+}
+
+// ---------- 2. the bouquet ----------
+const BASE = { x: 50, y: 98 };
+const PINK  = { inner: '#b0124f', mid: '#ee5f93', outer: '#ffd0e2' };
+const WHITE = { inner: '#e0c46a', mid: '#fff0c8', outer: '#ffffff' };
+
+// d = seconds before this flower starts to grow
+const STEMS = [
+  { x: 33, y: 30, kind: 'flower', size: 16, rot: -0.35, tilt: 0.70, col: PINK,  ph: 0.0, d: 1.2 },
+  { x: 22, y: 54, kind: 'flower', size: 15, rot:  0.25, tilt: 0.60, col: PINK,  ph: 1.3, d: 2.6 },
+  { x: 71, y: 50, kind: 'flower', size: 16, rot:  0.20, tilt: 0.65, col: PINK,  ph: 2.1, d: 3.8 },
+  { x: 52, y: 38, kind: 'flower', size: 12, rot: -0.10, tilt: 0.80, col: WHITE, ph: 0.7, d: 5.0 },
+  { x: 64, y: 20, kind: 'flower', size: 10, rot:  0.40, tilt: 0.60, col: WHITE, ph: 3.0, d: 6.2 },
+  { x: 44, y: 14, kind: 'bud',    size: 10, ph: 1.9, d: 4.0 },
+  { x: 80, y: 31, kind: 'bud',    size:  9, ph: 2.6, d: 5.0 },
+  { x: 14, y: 36, kind: 'bud',    size:  8, ph: 0.4, d: 3.0 },
+];
+
+function quad(p0, c, p1, t) {
+  const m = 1 - t;
+  return {
+    x: m * m * p0.x + 2 * m * t * c.x + t * t * p1.x,
+    y: m * m * p0.y + 2 * m * t * c.y + t * t * p1.y,
+  };
+}
+
+function ellipseLeaf(x, y, len, wid, ang, color) {
+  if (len < 0.2) return;
+  octx.fillStyle = color;
+  octx.beginPath();
+  octx.ellipse(x, y, len, Math.max(wid, 0.2), ang, 0, Math.PI * 2);
+  octx.fill();
+}
+
+// One lily. bloom: 0 = closed bud pointing up, 1 = fully open.
+function lily(x, y, size, rot, tilt, col, u, bloom) {
+  const e = ease(bloom);
+  const L = size * u * lerp(0.5, 1, e);        // petals lengthen as they open
+  const W = size * u * lerp(0.16, 0.33, e);    // and get wider
+
+  octx.save();
+  octx.translate(x, y);
+  octx.rotate(rot);
+  octx.scale(1, lerp(1, tilt, e));             // open flowers tip towards viewer
+
+  for (let i = 0; i < 6; i++) {
+    // closed: all petals point up with a tiny spread. open: spread round.
+    const closedA = -Math.PI / 2 + (i - 2.5) * 0.07;
+    const openA = (i * Math.PI) / 3 + 0.25;
+    const a = lerp(closedA, openA, e);
+
+    octx.save();
+    octx.rotate(a);
+    const g = octx.createLinearGradient(0, 0, L, 0);
+    g.addColorStop(0, col.inner);
+    g.addColorStop(0.45, col.mid);
+    g.addColorStop(1, col.outer);
+    octx.fillStyle = g;
+    octx.beginPath();
+    octx.moveTo(0, 0);
+    octx.quadraticCurveTo(L * 0.45, -W, L, 0);
+    octx.quadraticCurveTo(L * 0.45, W, 0, 0);
+    octx.fill();
+    // centre vein
+    octx.strokeStyle = col.inner;
+    octx.globalAlpha = 0.55;
+    octx.lineWidth = 0.35 * u;
+    octx.beginPath();
+    octx.moveTo(0, 0);
+    octx.lineTo(L * 0.75, 0);
+    octx.stroke();
+    octx.globalAlpha = 1;
+    octx.restore();
+  }
+
+  // stamens appear as the flower opens
+  if (e > 0.35) {
+    const s = (e - 0.35) / 0.65;
+    for (let i = 0; i < 6; i++) {
+      const a = (i * Math.PI) / 3 + 0.6;
+      const r = L * 0.5 * s;
+      octx.strokeStyle = '#e8d79a';
+      octx.lineWidth = 0.3 * u;
+      octx.beginPath();
+      octx.moveTo(0, 0);
+      octx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+      octx.stroke();
+      octx.fillStyle = '#f5b98a';
+      octx.beginPath();
+      octx.arc(Math.cos(a) * r, Math.sin(a) * r, 0.75 * u, 0, Math.PI * 2);
+      octx.fill();
+    }
+  }
+  octx.restore();
+}
+
+// ---------- 3. paint the bouquet for time p (seconds) ----------
+function drawScene(p) {
+  octx.setTransform(1, 0, 0, 1, 0, 0);
+  octx.clearRect(0, 0, cols, rows);
+  octx.setTransform(1, 0, 0, cellW / cellH, 0, 0);   // draw in square units
+  octx.lineCap = 'round';
+
+  const u = Math.min(sh / 100, sw / 90);
+  const X = (x) => sw / 2 + (x - 50) * u;
+  const Y = (y) => sh / 2 + (y - 50) * u;
+  const base = { x: X(BASE.x), y: Y(BASE.y) };
+  const t = p;
+
+  // foliage: thin blades that grow up from the base first
+  const foliageGrow = ease(clamp(p / 2.5, 0, 1));
+  for (let k = 0; k < 50; k++) {
+    const f = k / 49;
+    const a = (f - 0.5) * 2.3;
+    const len = (14 + 12 * Math.cos(a * 1.1) + (k % 5) * 1.5) * u * foliageGrow;
+    const sway = Math.sin(t * 0.9 + k) * 0.05;
+    const tip = { x: base.x + Math.sin(a + sway) * len, y: base.y - Math.cos(a + sway) * len * 0.9 };
+    const c = { x: base.x + Math.sin(a) * len * 0.35, y: base.y - len * 0.55 };
+    octx.strokeStyle = k % 3 ? '#7fa57a' : '#a9c9a0';
+    octx.lineWidth = 0.9 * u;
+    octx.beginPath();
+    octx.moveTo(base.x, base.y);
+    octx.quadraticCurveTo(c.x, c.y, tip.x, tip.y);
+    octx.stroke();
+  }
+
+  const heads = [];
+  for (const s of STEMS) {
+    const grow = ease(clamp((p - s.d * 0.5) / 3, 0, 1));    // stem rises
+    if (grow <= 0) continue;
+    const sway = Math.sin(t * 0.8 + s.ph) * 1.4 * grow;
+    const tipFull = { x: X(s.x + sway), y: Y(s.y) };
+    const c = { x: base.x + (tipFull.x - base.x) * 0.15, y: (base.y + tipFull.y) / 2 };
+
+    octx.strokeStyle = '#8db888';
+    octx.lineWidth = 1.5 * u;
+    octx.beginPath();
+    octx.moveTo(base.x, base.y);
+    for (let i = 1; i <= 24; i++) {
+      const q = quad(base, c, tipFull, grow * i / 24);
+      octx.lineTo(q.x, q.y);
+    }
+    octx.stroke();
+
+    // leaves along the stem, appearing as the stem passes them
+    for (let i = 1; i <= 4; i++) {
+      const pos = 0.2 + i * 0.16;
+      const k = clamp((grow - pos) * 5, 0, 1);
+      if (k <= 0) continue;
+      const q = quad(base, c, tipFull, pos);
+      const side = i % 2 ? 1 : -1;
+      ellipseLeaf(q.x + side * 3 * u * k, q.y - 1.5 * u, 4.5 * u * k, 0.9 * u * k, side * -0.6, '#6fb52c');
+    }
+
+    const tip = quad(base, c, tipFull, grow);
+    heads.push({ s, tip, c, grow });
+  }
+
+  // heads on top of the stems
+  for (const { s, tip, c, grow } of heads) {
+    if (grow < 0.6) continue;
+    const appear = clamp((grow - 0.6) / 0.4, 0, 1);
+    if (s.kind === 'bud') {
+      const ang = Math.atan2(tip.y - c.y, tip.x - c.x);
+      const swell = appear * (1 + 0.15 * ease(clamp((p - s.d) / 8, 0, 1)));
+      ellipseLeaf(tip.x, tip.y, s.size * 0.6 * u * swell, s.size * 0.17 * u * swell, ang, '#bcd3a0');
+      ellipseLeaf(tip.x, tip.y, s.size * 0.3 * u * swell, s.size * 0.09 * u * swell, ang, '#f1ebb8');
+    } else {
+      const bloom = clamp((p - (s.d + 1.5)) / 4.5, 0, 1);   // opens after the stem arrives
+      const wobble = Math.sin(t * 0.8 + s.ph) * 0.06;
+      lily(tip.x, tip.y, s.size * appear, s.rot + wobble, s.tilt, s.col, u, bloom);
+    }
+  }
+}
+
+// ---------- 4. turn pixels into characters ----------
+function render(p) {
+  drawScene(p);
+  const data = octx.getImageData(0, 0, cols, rows).data;
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, canvas.width / dpr, canvas.height / dpr);
+  ctx.font = `bold ${fontSize}px ${FONT}`;
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'center';
+
+  for (let j = 0; j < rows; j++) {
+    for (let i = 0; i < cols; i++) {
+      const k = (j * cols + i) * 4;
+      const a = data[k + 3];
+      if (a < 50) continue;
+      const r = data[k], g = data[k + 1], b = data[k + 2];
+      const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+      // only dense glyphs: the colour carries the picture, not the letter
+      const ch = lum > 0.6 ? '+' : lum > 0.35 ? '*' : '%';
+      ctx.globalAlpha = Math.min(0.85, a / 200);
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      ctx.fillText(ch, ox + (i + 0.5) * cellW, oy + (j + 0.5) * cellH);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------- 5. animation loop ----------
+let t0 = performance.now();
+let last = 0;
+function frame(now) {
+  if (now - last > 33) {                       // ~30 fps
+    last = now;
+    render((now - t0) / 1000);
+  }
+  requestAnimationFrame(frame);
+}
+
+function replay() { t0 = performance.now(); typeMessage(); }
+window.addEventListener('click', replay);
+window.addEventListener('keydown', (e) => { if (e.code === 'Space') replay(); });
+window.addEventListener('resize', resize);
+// ---------- typewriter message ----------
+const MESSAGE = " ";
+const msgEl = document.getElementById('msg');
+let typeTimer;
+
+function typeMessage(delay = 7000) {          // wait for the bloom first
+  clearInterval(typeTimer);
+  msgEl.textContent = '';
+  let i = 0;
+  setTimeout(() => {
+    typeTimer = setInterval(() => {
+      msgEl.textContent = MESSAGE.slice(0, ++i);
+      if (i >= MESSAGE.length) clearInterval(typeTimer);
+    }, 80);                                    // ms per letter
+  }, delay);
+}
+typeMessage();
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
